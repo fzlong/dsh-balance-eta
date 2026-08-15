@@ -31,7 +31,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 
-export const name = "dsh-balance-eta-final";
+export const name = "dsh-balance-eta-window";
 export const inject = ["webServer"];
 
 const STATE_FILE_NAME = "balance-eta.json";
@@ -86,28 +86,27 @@ function toCents(n) {
 	return Math.round((Number(n) ?? 0) * 100) / 100;
 }
 
-/** 返回 { today, elapsed }：今日日期、今日已过时间占比（下限 0.05 防首分钟除零，上限 1）。 */
+/** 返回 { today }：今日日期（YYYY-MM-DD）。 */
 function dayInfo(nowMs) {
 	const d = new Date(nowMs);
 	const y = d.getFullYear();
 	const m = String(d.getMonth() + 1).padStart(2, "0");
 	const day = String(d.getDate()).padStart(2, "0");
-	const today = `${y}-${m}-${day}`;
-	const dayStart = new Date(y, d.getMonth(), d.getDate()).getTime();
-	const elapsed = Math.min(1, Math.max(0.05, (nowMs - dayStart) / DAY_MS));
-	return { today, elapsed };
+	return { today: `${y}-${m}-${day}` };
 }
 
 /**
  * 组合余额状态：返回 { todayConsumed, dailyRate, daysLeft, seeded }。
  * - todayConsumed：当日 opening − 当前（余额上升视为 0）。
- * - dailyRate（预测核心）：今日消耗速率优先——今日消耗 ÷ 今日已过时间占比，
- *   因为今天的消耗是最新、最贴近"当前烧钱速度"的信号；今日无消耗时回退到
- *   历史窗口速率（每日余额快照首尾差 ÷ 跨度天数）。
+ * - dailyRate（预测核心）：滑动窗口速率——取「今日 + 最近若干日」的余额快照，
+ *   用首尾差额 ÷ 实际时间跨度算出每 24 小时平均消耗。
+ *   相比"今日消耗 ÷ 今日已过时间占比"，窗口法没有日内漂移（早上不会虚高、
+ *   晚上不会虚低），且天然平滑（窗口内有多个点）。
+ *   窗口取最近 7 个快照（含今天），至少需要 2 个点才有速率。
  * - daysLeft = 余额 ÷ dailyRate。
  */
 function analyze(state, total, nowMs) {
-	const { today, elapsed } = dayInfo(nowMs);
+	const { today } = dayInfo(nowMs);
 
 	// 当日 opening：跨天或首次 -> 当前余额为基准。
 	let opening = state?.opening ?? null;
@@ -129,21 +128,19 @@ function analyze(state, total, nowMs) {
 		opening = { date: today, balance: total };
 	}
 
-	// 今日速率（优先）：今日消耗 ÷ 今日已过时间占比——最新信号。
-	const todayRate = todayConsumed > 0 ? todayConsumed / elapsed : null;
-
-	// 历史窗口速率（兜底）：最早快照到当前的总消耗 ÷ 跨度天数。
-	let windowRate = null;
-	if (days.length >= 2) {
-		const first = days[0];
+	// 滑动窗口速率：取最近 7 个快照（含今天），首尾差额 ÷ 实际时间跨度。
+	// 时间跨度用首快照当天 0 点 -> 现在，避免把整天外的空档算进消耗。
+	const window = days.slice(-7);
+	let dailyRate = null;
+	if (window.length >= 2) {
+		const first = window[0];
 		const spanMs = nowMs - new Date(first.date + "T00:00:00").getTime();
 		const spanDays = Math.max(1, spanMs / DAY_MS);
 		const consumed = first.balance - total;
-		if (consumed > 0.001) windowRate = consumed / spanDays;
+		if (consumed > 0.001) dailyRate = consumed / spanDays;
 	}
 
-	const dailyRate = todayRate !== null ? todayRate : windowRate;
-	const seeded = todayRate !== null && (state?.days ?? []).length < 2;
+	const seeded = dailyRate !== null && (state?.days ?? []).length < 2;
 	const daysLeft = dailyRate !== null && total > 0 ? total / dailyRate : null;
 
 	writeState(statePath(), { days, opening, last: { t: nowMs, balance: total } });
