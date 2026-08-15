@@ -26,13 +26,12 @@
 //   lowBalanceCny  低余额告警阈值（元），默认 5
 //   warnDaysLeft   可用天数告警阈值（天），默认 3
 //   notify         余额过低时浏览器通知，默认 true
-//   ewmaAlpha      EWMA 平滑系数（0~1，越大越跟手），默认 0.3
 
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 
-export const name = "dsh-balance-eta";
+export const name = "dsh-balance-eta-final";
 export const inject = ["webServer"];
 
 const STATE_FILE_NAME = "balance-eta.json";
@@ -102,10 +101,12 @@ function dayInfo(nowMs) {
 /**
  * 组合余额状态：返回 { todayConsumed, dailyRate, daysLeft, seeded }。
  * - todayConsumed：当日 opening − 当前（余额上升视为 0）。
- * - dailyRate：优先 EWMA（跨天积累的平滑速率）；无 EWMA 时用「今日速率」
- *   （今日消耗 ÷ 今日已过时间占比）—— 冷启动当天即可用。
+ * - dailyRate（预测核心）：今日消耗速率优先——今日消耗 ÷ 今日已过时间占比，
+ *   因为今天的消耗是最新、最贴近"当前烧钱速度"的信号；今日无消耗时回退到
+ *   历史窗口速率（每日余额快照首尾差 ÷ 跨度天数）。
+ * - daysLeft = 余额 ÷ dailyRate。
  */
-function analyze(state, total, nowMs, alpha) {
+function analyze(state, total, nowMs) {
 	const { today, elapsed } = dayInfo(nowMs);
 
 	// 当日 opening：跨天或首次 -> 当前余额为基准。
@@ -116,18 +117,6 @@ function analyze(state, total, nowMs, alpha) {
 
 	const todayConsumed = total < opening.balance - 0.001 ? opening.balance - total : 0;
 
-	// EWMA：两次快照间隔 ≥ 1 小时才更新，防止短间隔抖动。
-	const last = state?.last ?? null;
-	let ewma = Number.isFinite(state?.ewma) ? state.ewma : null;
-	if (last !== null) {
-		const spanMs = nowMs - last.t;
-		if (spanMs >= 3600000) {
-			const delta = last.balance - total;
-			const instant = delta > 0.001 ? delta / (spanMs / DAY_MS) : 0;
-			ewma = ewma === null ? instant : alpha * instant + (1 - alpha) * ewma;
-		}
-	}
-
 	// 每日快照（显式按日期排序，保留最近 30 天）。
 	const prevDays = (state?.days ?? [])
 		.filter((d) => d && typeof d.date === "string" && d.date !== today && Number.isFinite(d.balance))
@@ -135,20 +124,29 @@ function analyze(state, total, nowMs, alpha) {
 		.slice(-30);
 	const days = [...prevDays, { date: today, balance: total }];
 
-	// 充值检测：当前余额高于最早快照 -> 重置今日 opening 与速率锚点。
+	// 充值检测：当前余额高于最早快照 -> 重置今日 opening（余额回归，速率锚点同步重置）。
 	if (days.length >= 2 && total > days[0].balance + 0.001) {
 		opening = { date: today, balance: total };
-		ewma = null;
 	}
 
-	// 今日速率（兜底）：今日消耗 ÷ 今日已过时间占比。
+	// 今日速率（优先）：今日消耗 ÷ 今日已过时间占比——最新信号。
 	const todayRate = todayConsumed > 0 ? todayConsumed / elapsed : null;
 
-	const dailyRate = ewma !== null && ewma > 0 ? ewma : todayRate;
-	const seeded = ewma === null && dailyRate !== null;
+	// 历史窗口速率（兜底）：最早快照到当前的总消耗 ÷ 跨度天数。
+	let windowRate = null;
+	if (days.length >= 2) {
+		const first = days[0];
+		const spanMs = nowMs - new Date(first.date + "T00:00:00").getTime();
+		const spanDays = Math.max(1, spanMs / DAY_MS);
+		const consumed = first.balance - total;
+		if (consumed > 0.001) windowRate = consumed / spanDays;
+	}
+
+	const dailyRate = todayRate !== null ? todayRate : windowRate;
+	const seeded = todayRate !== null && (state?.days ?? []).length < 2;
 	const daysLeft = dailyRate !== null && total > 0 ? total / dailyRate : null;
 
-	writeState(statePath(), { days, opening, last: { t: nowMs, balance: total }, ewma });
+	writeState(statePath(), { days, opening, last: { t: nowMs, balance: total } });
 	return { todayConsumed, dailyRate, daysLeft, seeded };
 }
 
@@ -158,7 +156,6 @@ export function apply(ctx, config = {}) {
 	const lowBalanceCny = config.lowBalanceCny ?? 5;
 	const warnDaysLeft = config.warnDaysLeft ?? 3;
 	const notify = config.notify !== false;
-	const alpha = Number.isFinite(config.ewmaAlpha) ? Math.min(1, Math.max(0, config.ewmaAlpha)) : 0.3;
 
 	ctx.effect(() => ctx.webServer.register({
 		kind: "exact",
@@ -196,7 +193,7 @@ export function apply(ctx, config = {}) {
 				const nowMs = Date.now();
 
 				const state = readState(statePath());
-				const { todayConsumed, dailyRate, daysLeft, seeded } = analyze(state, total, nowMs, alpha);
+				const { todayConsumed, dailyRate, daysLeft, seeded } = analyze(state, total, nowMs);
 
 				let level = "ok";
 				let levelReason = "";
